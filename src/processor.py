@@ -1,198 +1,272 @@
 """
-热点提取与排序模块：
-1. 对每条资讯用 LLM 生成中文摘要（英文条目同时保留原文）
-2. 按优先级 + 时效性综合评分排序
-3. 按 EN:ZH = 6:4 比例选出最终 10 条热点
+processor.py — 热点提取、设计相关性过滤、评分排序、LLM 摘要与翻译
+
+流程：
+  1. 关键词过滤：只保留与「AI 赋能设计」相关的条目
+  2. 去重（URL + 标题相似度）
+  3. 综合评分（优先级权重 × 时效性衰减）
+  4. 分语言排序，取 EN_COUNT / ZH_COUNT 条
+  5. LLM 生成摘要：英文条目输出「中英对照」，中文条目输出中文摘要
+     摘要聚焦「设计师可操作的实践价值」
 """
 
-import json
-import logging
+import hashlib
 import re
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 
-from .config import (
+import requests
+
+from config import (
     OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL,
-    EN_COUNT, ZH_COUNT, PRIORITY,
+    PRIORITY, EN_COUNT, ZH_COUNT,
+    DESIGN_KEYWORDS_EN, DESIGN_KEYWORDS_ZH,
 )
 
-logger = logging.getLogger(__name__)
 
-CST = timezone(timedelta(hours=8))
+# ─────────────────────────────────────────────────────────────────────────────
+# 关键词过滤
+# ─────────────────────────────────────────────────────────────────────────────
 
+def _is_design_relevant(item: Dict[str, Any]) -> bool:
+    """判断条目是否与「AI 赋能设计」相关"""
+    lang = item.get("lang", "en")
+    text = (
+        (item.get("title") or "") + " " +
+        (item.get("summary") or "") + " " +
+        (item.get("url") or "")
+    ).lower()
 
-# ─────────────────────────────────────────────
-# LLM 调用（使用 requests 直接调用，避免 SDK 版本问题）
-# ─────────────────────────────────────────────
-import requests as _requests
-
-def _llm_chat(messages: list, max_tokens: int = 300, temperature: float = 0.3) -> str:
-    """直接调用 OpenAI 兼容 API，返回 assistant 消息内容。"""
-    if not OPENAI_API_KEY:
-        return ""
-    base = OPENAI_BASE_URL.rstrip("/")
-    url = f"{base}/chat/completions"
-    payload = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    try:
-        resp = _requests.post(url, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        logger.warning("LLM API call failed: %s", exc)
-        return ""
+    keywords = DESIGN_KEYWORDS_ZH if lang == "zh" else DESIGN_KEYWORDS_EN
+    for kw in keywords:
+        if kw.lower() in text:
+            return True
+    return False
 
 
-# ─────────────────────────────────────────────
-# 评分函数
-# ─────────────────────────────────────────────
-def _time_decay(pub_dt: datetime) -> float:
-    """
-    时效性衰减：距离现在越近分数越高。
-    24h 内满分 1.0，每超过 1h 衰减 0.02，最低 0.1。
-    """
-    now = datetime.now(tz=CST)
-    hours_ago = max(0, (now - pub_dt).total_seconds() / 3600)
-    score = max(0.1, 1.0 - hours_ago * 0.02)
-    return score
-
-
-def _compute_score(item: Dict[str, Any]) -> float:
-    """综合评分 = 优先级权重 * 时效性衰减 + 热度分（归一化）"""
-    priority_weight = PRIORITY.get(item.get("category", "aggregator"), 1)
-    time_score = _time_decay(item["pub_dt"])
-    hot_score = min(item.get("score", 0) / 500.0, 1.0)
-    return priority_weight * time_score + hot_score * 0.5
-
-
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # 去重
-# ─────────────────────────────────────────────
-def _deduplicate(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """基于标题指纹去重。"""
-    seen: List[str] = []
-    result: List[Dict[str, Any]] = []
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _url_key(url: str) -> str:
+    return re.sub(r"https?://(www\.)?", "", url).rstrip("/").lower()
+
+
+def _title_key(title: str) -> str:
+    return re.sub(r"\W+", "", title).lower()[:60]
+
+
+def _dedup(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen_urls, seen_titles, result = set(), set(), []
     for item in items:
-        title = item["title"].lower().strip()
-        fingerprint = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", title)[:30]
-        if fingerprint in seen:
+        uk = _url_key(item.get("url", ""))
+        tk = _title_key(item.get("title", ""))
+        if uk in seen_urls or tk in seen_titles:
             continue
-        seen.append(fingerprint)
+        seen_urls.add(uk)
+        seen_titles.add(tk)
         result.append(item)
     return result
 
 
-# ─────────────────────────────────────────────
-# LLM 摘要与翻译
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 评分排序
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _score(item: Dict[str, Any]) -> float:
+    priority_w = PRIORITY.get(item.get("category", "aggregator"), 1)
+
+    # 时效性衰减：24h 内满分，之后每小时衰减 2%
+    pub_ts = item.get("published_ts")
+    if pub_ts:
+        age_h = max(0, (time.time() - pub_ts) / 3600)
+        freshness = max(0.1, 1.0 - max(0, age_h - 24) * 0.02)
+    else:
+        freshness = 0.5
+
+    return priority_w * freshness
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM 调用
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _llm(messages: list, max_tokens: int = 600) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.4,
+    }
+    try:
+        resp = requests.post(
+            f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=45,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[LLM] error: {e}")
+        return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 英文条目：生成「中英对照」摘要，聚焦设计可操作性
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _summarize_en(item: Dict[str, Any]) -> Dict[str, Any]:
-    """英文条目：生成中文标题 + 中文摘要（中英对照）。"""
-    title = item["title"]
-    raw_summary = item.get("summary", "")
+    title = item.get("title", "")
+    summary = item.get("summary", "")[:800]
 
-    prompt = (
-        "You are an AI news editor. Given the following English AI news title and snippet, produce:\n"
-        "1. A concise Chinese title translation\n"
-        "2. A Chinese summary of 2-3 sentences (核心要点，不超过120字)\n\n"
-        f"Title: {title}\n"
-        f"Snippet: {raw_summary[:300]}\n\n"
-        'Respond ONLY with valid JSON:\n{"zh_title": "...", "zh_summary": "..."}'
-    )
+    prompt = f"""你是一位专注于「AI 赋能设计」的资讯编辑，服务对象是平面设计师、电商设计师和品牌设计师。
 
-    content = _llm_chat([{"role": "user", "content": prompt}], max_tokens=300)
+请根据以下英文资讯，完成两件事：
+1. 用一句话（≤20字）翻译标题为中文
+2. 用 2-3 句话写一段中文摘要，重点回答：
+   - 这个 AI 工具/功能/趋势是什么？
+   - 设计师可以怎么用？有哪些具体操作场景？
+   - 对平面/电商/品牌设计工作流有什么实际价值？
 
-    if content:
-        try:
-            json_match = re.search(r"\{.*\}", content, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                item["zh_title"] = data.get("zh_title", title)
-                item["zh_summary"] = data.get("zh_summary", "")
-                return item
-        except Exception:
-            pass
+输出格式（严格按此格式，不要多余内容）：
+【中文标题】<翻译后的标题>
+【中文摘要】<2-3句中文摘要>
 
-    item["zh_title"] = title
-    item["zh_summary"] = ""
+---
+原标题：{title}
+原文摘要：{summary}
+"""
+
+    result = _llm([{"role": "user", "content": prompt}], max_tokens=400)
+
+    zh_title = ""
+    zh_summary = ""
+    if result:
+        for line in result.splitlines():
+            if line.startswith("【中文标题】"):
+                zh_title = line.replace("【中文标题】", "").strip()
+            elif line.startswith("【中文摘要】"):
+                zh_summary = line.replace("【中文摘要】", "").strip()
+
+    item["zh_title"]   = zh_title or title
+    item["zh_summary"] = zh_summary or summary[:120]
     return item
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 中文条目：生成设计可操作性摘要
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _summarize_zh(item: Dict[str, Any]) -> Dict[str, Any]:
-    """中文条目：生成 2~3 句中文摘要。"""
-    title = item["title"]
-    raw_summary = item.get("summary", "")
+    title = item.get("title", "")
+    summary = item.get("summary", "")[:800]
 
-    if not raw_summary:
-        item["zh_summary"] = ""
-        return item
+    prompt = f"""你是一位专注于「AI 赋能设计」的资讯编辑，服务对象是平面设计师、电商设计师和品牌设计师。
 
-    prompt = (
-        "你是一位AI资讯编辑。请根据以下标题和摘要，用2~3句话（不超过100字）提炼核心要点，语言简洁专业。\n\n"
-        f"标题：{title}\n"
-        f"摘要：{raw_summary[:300]}\n\n"
-        "只输出摘要文本，不要其他内容。"
-    )
+请根据以下资讯，用 2-3 句话写一段摘要，重点回答：
+- 这个 AI 工具/功能/趋势是什么？
+- 设计师可以怎么用？有哪些具体操作场景？
+- 对平面/电商/品牌设计工作流有什么实际价值？
 
-    content = _llm_chat([{"role": "user", "content": prompt}], max_tokens=200)
-    item["zh_summary"] = content if content else raw_summary[:100]
+只输出摘要文字，不要标题、不要序号、不要多余内容。
+
+---
+标题：{title}
+原文摘要：{summary}
+"""
+
+    result = _llm([{"role": "user", "content": prompt}], max_tokens=300)
+    item["zh_summary"] = result or summary[:120]
     return item
 
 
-# ─────────────────────────────────────────────
-# 主处理流程
-# ─────────────────────────────────────────────
-def process(raw: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+# ─────────────────────────────────────────────────────────────────────────────
+# 判断「可操作性」标签
+# ─────────────────────────────────────────────────────────────────────────────
+
+ACTIONABLE_KEYWORDS = [
+    # 工具发布/更新
+    "launch", "release", "update", "new feature", "tutorial", "how to",
+    "workflow", "tips", "guide", "step by step", "plugin", "extension",
+    "发布", "上线", "更新", "新功能", "教程", "使用指南",
+    "工作流", "技巧", "插件", "实操", "怎么用", "如何",
+]
+
+def _tag_actionable(item: Dict[str, Any]) -> Dict[str, Any]:
+    """若资讯含有可操作性信号，打上标签"""
+    text = (
+        (item.get("title") or "") + " " +
+        (item.get("summary") or "") + " " +
+        (item.get("zh_summary") or "")
+    ).lower()
+    item["actionable"] = any(kw.lower() in text for kw in ACTIONABLE_KEYWORDS)
+    return item
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 主入口
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process(raw_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    输入：fetch_all() 返回的 {"en": [...], "zh": [...]}
-    输出：最终热点列表（≤10条，EN:ZH ≈ 6:4）
+    输入：fetcher 返回的原始条目列表
+    输出：最终推送的 10 条（EN×6 + ZH×4），每条含摘要和标签
     """
-    en_items = raw.get("en", [])
-    zh_items = raw.get("zh", [])
+    print(f"[processor] 原始条目: {len(raw_items)}")
 
-    # 1. 计算综合评分
-    for item in en_items:
-        item["_score"] = _compute_score(item)
-    for item in zh_items:
-        item["_score"] = _compute_score(item)
+    # 1. 关键词过滤（只保留设计相关）
+    filtered = [item for item in raw_items if _is_design_relevant(item)]
+    print(f"[processor] 设计相关过滤后: {len(filtered)}")
 
-    # 2. 排序
-    en_items.sort(key=lambda x: x["_score"], reverse=True)
-    zh_items.sort(key=lambda x: x["_score"], reverse=True)
+    # 2. 去重
+    deduped = _dedup(filtered)
+    print(f"[processor] 去重后: {len(deduped)}")
 
-    # 3. 去重
-    en_items = _deduplicate(en_items)
-    zh_items = _deduplicate(zh_items)
+    # 3. 分语言
+    en_items = [i for i in deduped if i.get("lang") == "en"]
+    zh_items = [i for i in deduped if i.get("lang") == "zh"]
 
-    # 4. 取 Top-N
-    top_en = en_items[:EN_COUNT]
-    top_zh = zh_items[:ZH_COUNT]
+    # 4. 评分排序
+    en_items.sort(key=_score, reverse=True)
+    zh_items.sort(key=_score, reverse=True)
 
-    # 5. LLM 摘要（带速率保护）
+    # 5. 取 Top N
+    en_top = en_items[:EN_COUNT]
+    zh_top = zh_items[:ZH_COUNT]
+
+    print(f"[processor] 英文候选: {len(en_items)}, 取 {len(en_top)} 条")
+    print(f"[processor] 中文候选: {len(zh_items)}, 取 {len(zh_top)} 条")
+
+    # 6. LLM 摘要
     processed_en = []
-    for item in top_en:
-        processed_en.append(_summarize_en(item))
-        time.sleep(0.5)
+    for item in en_top:
+        try:
+            processed_en.append(_summarize_en(item))
+        except Exception as e:
+            print(f"[processor] EN summarize error: {e}")
+            item["zh_title"]   = item.get("title", "")
+            item["zh_summary"] = item.get("summary", "")[:120]
+            processed_en.append(item)
 
     processed_zh = []
-    for item in top_zh:
-        processed_zh.append(_summarize_zh(item))
-        time.sleep(0.5)
+    for item in zh_top:
+        try:
+            processed_zh.append(_summarize_zh(item))
+        except Exception as e:
+            print(f"[processor] ZH summarize error: {e}")
+            item["zh_summary"] = item.get("summary", "")[:120]
+            processed_zh.append(item)
 
-    # 6. 合并：英文在前，中文在后
-    final = processed_en + processed_zh
+    # 7. 可操作性标签
+    all_items = [_tag_actionable(i) for i in processed_en + processed_zh]
 
-    logger.info(
-        "Processing complete: EN=%d, ZH=%d, Total=%d",
-        len(processed_en), len(processed_zh), len(final),
-    )
-    return final
+    print(f"[processor] 最终输出: {len(all_items)} 条")
+    return all_items
