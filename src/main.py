@@ -9,9 +9,9 @@ import traceback
 
 sys.path.insert(0, "/home/ubuntu/ai_news_bot/src")
 
-from fetcher   import fetch_all
-from processor import process
-from notifier  import send, send_error
+from .fetcher  import fetch_all
+from .processor import process
+from .notifier import send, send_error
 
 
 def run():

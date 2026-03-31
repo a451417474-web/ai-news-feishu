@@ -18,7 +18,7 @@ from typing import List, Dict, Any
 
 import requests
 
-from config import (
+from .config import (
     OPENAI_API_KEY, OPENAI_BASE_URL, LLM_MODEL,
     PRIORITY, EN_COUNT, ZH_COUNT,
     DESIGN_KEYWORDS_EN, DESIGN_KEYWORDS_ZH,

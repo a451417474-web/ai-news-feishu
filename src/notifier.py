@@ -12,7 +12,7 @@ from typing import List, Dict, Any
 
 import requests
 
-from config import FEISHU_WEBHOOK
+from .config import FEISHU_WEBHOOK
 
 CST = timezone(timedelta(hours=8))
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]

@@ -15,7 +15,7 @@ from typing import List, Dict, Any
 import feedparser
 import requests
 
-from config import (
+from .config import (
     EN_SOURCES, ZH_SOURCES,
     REQUEST_TIMEOUT, MAX_ITEMS_PER_SOURCE,
 )
