@@ -11,11 +11,15 @@ jobs:
   push-news:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write   # 允许提交保活文件
 
     steps:
       # ── 1. 检出代码 ────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # ── 2. 设置 Python 3.11 ────────────────────────────────
       - name: Set up Python 3.11
@@ -39,3 +43,13 @@ jobs:
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: |
           python -m src.main
+
+      # ── 5. 提交时间戳保活（防止 GitHub 暂停 schedule）──────
+      - name: Keep repository active
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "last_run: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .last_run
+          git add .last_run
+          git diff --staged --quiet || git commit -m "chore: keep alive $(date -u '+%Y-%m-%d')"
+          git push
